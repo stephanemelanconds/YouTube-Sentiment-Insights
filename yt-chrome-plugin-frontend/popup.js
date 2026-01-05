@@ -2,9 +2,25 @@
 
 document.addEventListener("DOMContentLoaded", async () => {
   const outputDiv = document.getElementById("output");
-  const API_KEY = 'AIzaSyAHxO8ZCKPLODbhgSQcDV49Bv8cgkOA8Z4';  // Replace with your actual YouTube Data API key
-  // const API_URL = 'http://my-elb-2062136355.us-east-1.elb.amazonaws.com:80';   
-  const API_URL = 'http://localhost:5000/';
+  const BASE_URL = 'http://localhost:5000'; 
+  
+  let API_KEY = '';
+
+  try {
+      // 1. Fetch the API KEY dynamically from your Python backend
+      const configResponse = await fetch(`${BASE_URL}/get_config`);
+      const configData = await configResponse.json();
+      
+      API_KEY = configData.YOUTUBE_API_KEY;
+      console.log("API Key successfully shipped from Python to JS");
+
+      // 2. Now proceed with your YouTube logic using the retrieved API_KEY
+      // Example: fetch(`https://www.googleapis.com/youtube/v3/...&key=${API_KEY}`)
+      
+  } catch (error) {
+      console.error("Could not load config from backend:", error);
+      outputDiv.innerText = "Error: Ensure your Flask server is running.";
+  }
 
   // Get the current tab's URL
   chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {

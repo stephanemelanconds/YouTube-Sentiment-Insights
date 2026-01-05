@@ -15,6 +15,21 @@ from nltk.stem import WordNetLemmatizer
 from mlflow.tracking import MlflowClient
 import matplotlib.dates as mdates
 import pickle
+from dotenv import load_dotenv
+
+import os
+load_dotenv()  # Load environment variables from .env file
+
+os.environ['AWS_ACCESS_KEY_ID'] = os.getenv('AWS_ACCESS_KEY_ID')
+os.environ['AWS_SECRET_ACCESS_KEY'] = os.getenv('AWS_SECRET_ACCESS_KEY')
+os.environ['AWS_DEFAULT_REGION'] = os.getenv('AWS_DEFAULT_REGION')
+
+from googleapiclient.discovery import build
+
+# Load the API_KEY from the .env file
+API_KEY = os.getenv('API_KEY')
+youtube = build('youtube', 'v3', developerKey=API_KEY)
+
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -51,38 +66,65 @@ def preprocess_comment(comment):
 
 
 # Load the model and vectorizer from the model registry and local storage
-# def load_model_and_vectorizer(model_name, model_version, vectorizer_path):
-#     # Set MLflow tracking URI to your server
-#     mlflow.set_tracking_uri("http://ec2-54-167-108-249.compute-1.amazonaws.com:5000/")  # Replace with your MLflow tracking URI
-#     client = MlflowClient()
-#     model_uri = f"models:/{model_name}/{model_version}"
-#     model = mlflow.pyfunc.load_model(model_uri)
-#     with open(vectorizer_path, 'rb') as file:
-#         vectorizer = pickle.load(file)
+def load_model_and_vectorizer(model_name, model_version, vectorizer_path):
+    # Set MLflow tracking URI to your server
+    mlflow.set_tracking_uri("http://ec2-3-238-124-243.compute-1.amazonaws.com:5000/")  # Replace with your MLflow tracking URI
+    client = MlflowClient()
+    model_uri = f"models:/{model_name}/{model_version}"
+    model = mlflow.pyfunc.load_model(model_uri)
+    with open(vectorizer_path, 'rb') as file:
+        vectorizer = pickle.load(file)
    
-#     return model, vectorizer
+    return model, vectorizer
 
-
-
-def load_model(model_path, vectorizer_path):
-    """Load the trained model."""
+def load_model_and_vectorizer(model_name, model_version, vectorizer_path):
+    mlflow.set_tracking_uri("http://ec2-3-238-124-243.compute-1.amazonaws.com:5000")
+    
+    # Try loading by version
+    model_uri = f"models:/{model_name}/{model_version}"
+    
     try:
-        with open(model_path, 'rb') as file:
-            model = pickle.load(file)
-        
-        with open(vectorizer_path, 'rb') as file:
-            vectorizer = pickle.load(file)
-      
-        return model, vectorizer
+        model = mlflow.pyfunc.load_model(model_uri)
     except Exception as e:
-        raise
+        print(f"Registry load failed, attempting direct run load: {e}")
+        # FALLBACK: Use the Run ID directly if the registry path is still bugged
+        # Replace this ID with the one from your logs: 28155f30930c48b8bbea615db730bee1
+        model_uri = "runs:/28155f30930c48b8bbea615db730bee1/lgbm_model"
+        model = mlflow.pyfunc.load_model(model_uri)
 
+    with open(vectorizer_path, 'rb') as file:
+        vectorizer = pickle.load(file)
+   
+    return model, vectorizer
+
+#def load_model(model_path, vectorizer_path):
+#    """Load the trained model."""
+#    try:
+#        with open(model_path, 'rb') as file:
+#            model = pickle.load(file)
+#        
+#        with open(vectorizer_path, 'rb') as file:
+#            vectorizer = pickle.load(file)
+#      
+#        return model, vectorizer
+#    except Exception as e:
+#        raise
+
+
+@app.route('/get_config', methods=['GET'])
+def get_config():
+    """Sends the API key from the server's .env to the JavaScript frontend."""
+    return jsonify({
+        "API_KEY": os.getenv('API_KEY')
+    })
 
 # Initialize the model and vectorizer
-model, vectorizer = load_model("./lgbm_model.pkl", "./tfidf_vectorizer.pkl")  
+# model, vectorizer = load_model("./lgbm_model.pkl", "./tfidf_vectorizer.pkl")  
 
 # Initialize the model and vectorizer
-# model, vectorizer = load_model_and_vectorizer("my_model", "1", "./tfidf_vectorizer.pkl")  # Update paths and versions as needed
+model, vectorizer = load_model_and_vectorizer("yt_chrome_plugin_model", "1", "./tfidf_vectorizer.pkl")  # Update paths and versions as needed
+
+# model, vectorizer = load_model_and_vectorizer("28155f30930c48b8bbea615db730bee1", "./tfidf_vectorizer.pkl")
 
 @app.route('/')
 def home():
@@ -99,65 +141,72 @@ def predict_with_timestamps():
         return jsonify({"error": "No comments provided"}), 400
 
     try:
+        # 1. Extract data from JSON
         comments = [item['text'] for item in comments_data]
         timestamps = [item['timestamp'] for item in comments_data]
 
-        # Preprocess each comment before vectorizing
+        # 2. Preprocess
         preprocessed_comments = [preprocess_comment(comment) for comment in comments]
         
-        # Transform comments using the vectorizer
+        # 3. Vectorize (Sparse Matrix)
         transformed_comments = vectorizer.transform(preprocessed_comments)
 
-        # Convert the sparse matrix to dense format
-        dense_comments = transformed_comments.toarray()  # Convert to dense array
+        # 4. FIX: Convert to DataFrame with Feature Names (Schema Enforcement)
+        # This is what prevents the 'Failed to enforce schema' error
+        feature_names = vectorizer.get_feature_names_out()
+        df_input = pd.DataFrame(transformed_comments.toarray(), columns=feature_names)
         
-        # Make predictions
-        predictions = model.predict(dense_comments).tolist()  # Convert to list
+        # 5. Predict using the DataFrame
+        predictions = model.predict(df_input).tolist() 
         
-        # Convert predictions to strings for consistency
+        # Convert predictions to strings for consistency if your frontend expects strings
         predictions = [str(pred) for pred in predictions]
+
     except Exception as e:
+        # Added traceback print to help you debug in the terminal if something else fails
+        import traceback
+        print(traceback.format_exc())
         return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
     
-    # Return the response with original comments, predicted sentiments, and timestamps
-    response = [{"comment": comment, "sentiment": sentiment, "timestamp": timestamp} for comment, sentiment, timestamp in zip(comments, predictions, timestamps)]
+    # 6. Return response
+    response = [
+        {"comment": comment, "sentiment": sentiment, "timestamp": timestamp} 
+        for comment, sentiment, timestamp in zip(comments, predictions, timestamps)
+    ]
     return jsonify(response)
-
 
 
 @app.route('/predict', methods=['POST'])
 def predict():
     data = request.json
     comments = data.get('comments')
-    print("i am the comment: ",comments)
-    print("i am the comment type: ",type(comments))
     
     if not comments:
         return jsonify({"error": "No comments provided"}), 400
 
     try:
-        # Preprocess each comment before vectorizing
+        # 1. Preprocess
         preprocessed_comments = [preprocess_comment(comment) for comment in comments]
         
-        # Transform comments using the vectorizer
+        # 2. Vectorize (this returns a sparse matrix)
         transformed_comments = vectorizer.transform(preprocessed_comments)
 
-        # Convert the sparse matrix to dense format
-        dense_comments = transformed_comments.toarray()  # Convert to dense array
+        # 3. Create a DataFrame with the correct column names (The Fix)
+        # MLflow requires the feature names to match the schema it recorded
+        feature_names = vectorizer.get_feature_names_out()
+        df_input = pd.DataFrame(transformed_comments.toarray(), columns=feature_names)
         
-        # Make predictions
-        predictions = model.predict(dense_comments).tolist()  # Convert to list
+        # 4. Make predictions using the DataFrame
+        predictions = model.predict(df_input).tolist() 
         
-        # Convert predictions to strings for consistency
-        # predictions = [str(pred) for pred in predictions]
     except Exception as e:
+        # This will now give you more detail if it fails
+        import traceback
+        print(traceback.format_exc())
         return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
     
-    # Return the response with original comments and predicted sentiments
-    response = [{"comment": comment, "sentiment": sentiment} for comment, sentiment in zip(comments, predictions)]
+    response = [{"comment": comment, "sentiment": int(sentiment)} for comment, sentiment in zip(comments, predictions)]
     return jsonify(response)
-
-
 
 @app.route('/generate_chart', methods=['POST'])
 def generate_chart():
@@ -327,3 +376,7 @@ def generate_trend_graph():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
+
+    
+
+
